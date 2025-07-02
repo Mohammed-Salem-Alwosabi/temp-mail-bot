@@ -1,8 +1,8 @@
 import os
 import requests
 import json
-import asyncio # New: For async operations
-import asyncpg # New: PostgreSQL driver
+import asyncio 
+import asyncpg 
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
