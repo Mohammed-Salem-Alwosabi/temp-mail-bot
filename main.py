@@ -1,51 +1,112 @@
 import os
 import requests
 import json
-import time
+import asyncio # New: For async operations
+import asyncpg # New: PostgreSQL driver
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # --- Configuration ---
-# Get your Telegram Bot Token from environment variables (important for Railway deployment)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # Mail.tm API base URL
 MAILTM_API_URL = "https://api.mail.tm"
 
-# --- Global Variables to store user's current temp email ---
-# This is a simple in-memory storage. For a production bot with many users,
-# you would need a proper database (like SQLite, PostgreSQL, Redis)
-# to persist user email data across restarts and for multiple users.
-user_emails = {} # {chat_id: {"address": "...", "id": "...", "token": "..."}}
+# --- Database Connection Pool ---
+# We'll use a global variable for the connection pool
+db_pool = None
 
-# --- Mail.tm API Functions ---
+# --- Database Functions ---
+
+async def init_db_pool():
+    """Initializes the PostgreSQL connection pool."""
+    global db_pool
+    if db_pool is None:
+        try:
+            # Railway automatically injects DATABASE_URL from the added PostgreSQL service
+            # asyncpg can parse the DATABASE_URL directly
+            db_pool = await asyncpg.create_pool(os.getenv("DATABASE_URL"))
+            print("PostgreSQL connection pool created successfully.")
+            await create_table() # Ensure the table exists
+        except Exception as e:
+            print(f"Error creating PostgreSQL connection pool: {e}")
+            # Consider more robust error handling / retry logic here
+
+async def create_table():
+    """Creates the users_temp_emails table if it doesn't exist."""
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS users_temp_emails (
+                chat_id BIGINT PRIMARY KEY,
+                address TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                token TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        print("Table 'users_temp_emails' checked/created.")
+
+async def store_user_email(chat_id, email_data):
+    """Stores a user's temporary email information in the database."""
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO users_temp_emails (chat_id, address, account_id, token)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (chat_id) DO UPDATE
+            SET address = EXCLUDED.address,
+                account_id = EXCLUDED.account_id,
+                token = EXCLUDED.token,
+                created_at = CURRENT_TIMESTAMP
+        ''', chat_id, email_data["address"], email_data["id"], email_data["token"])
+    print(f"Stored email for chat_id: {chat_id}")
+
+async def get_user_email(chat_id):
+    """Retrieves a user's temporary email information from the database."""
+    async with db_pool.acquire() as conn:
+        record = await conn.fetchrow('''
+            SELECT address, account_id, token FROM users_temp_emails WHERE chat_id = $1
+        ''', chat_id)
+        if record:
+            return {
+                "address": record["address"],
+                "id": record["account_id"],
+                "token": record["token"]
+            }
+        return None
+    print(f"Retrieved email for chat_id: {chat_id}")
+
+async def delete_user_email_from_db(chat_id):
+    """Deletes a user's temporary email information from the database."""
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            DELETE FROM users_temp_emails WHERE chat_id = $1
+        ''', chat_id)
+    print(f"Deleted email from DB for chat_id: {chat_id}")
+
+# --- Mail.tm API Functions (No changes here, they are fine) ---
 
 async def get_domains():
     """Fetches available Mail.tm domains."""
     try:
         response = requests.get(f"{MAILTM_API_URL}/domains")
-        response.raise_for_status()  # Raise an exception for HTTP errors (e.g., 404, 500)
+        response.raise_for_status()
 
-        if not response.text: # Check if response body is empty
+        if not response.text:
             print("Mail.tm /domains endpoint returned empty response.")
             return []
 
-        data = response.json() # Changed variable name from 'domains' to 'data'
+        data = response.json()
 
-        # --- THIS IS THE CRUCIAL CHANGE ---
-        # Check if 'data' is a dictionary and contains 'hydra:member' key
         if isinstance(data, dict) and 'hydra:member' in data:
             domains_list = data['hydra:member']
         else:
-            # Fallback if 'hydra:member' isn't found or 'data' isn't a dict.
-            # This covers cases where it might be a direct list of domains, or unexpected format.
             print(f"Mail.tm /domains endpoint returned unexpected top-level data structure: {data}")
-            if isinstance(data, list): # Check if it's already a list (might happen)
+            if isinstance(data, list):
                 domains_list = data
             else:
-                return [] # Cannot process this format
+                return []
 
-        # Ensure 'domains_list' is actually a list/array
         if not isinstance(domains_list, list):
             print(f"Mail.tm /domains endpoint 'hydra:member' data is not a list: {domains_list}")
             return []
@@ -54,8 +115,6 @@ async def get_domains():
             print("Mail.tm /domains endpoint returned an empty list of domains (or hydra:member was empty).")
             return []
 
-        # Extract domain names from the list of domain objects
-        # Using a list comprehension with a check for the 'domain' key
         return [d["domain"] for d in domains_list if isinstance(d, dict) and "domain" in d]
 
     except requests.exceptions.HTTPError as e:
@@ -76,27 +135,25 @@ async def get_domains():
     except Exception as e:
         print(f"An unexpected error occurred in get_domains: {e}")
         return []
+
 async def create_account(username=None, domain=None):
     """Creates a new temporary email account."""
     if not domain:
         domains = await get_domains()
         if not domains:
             return None, "Could not fetch domains. Please try again later."
-        domain = domains[0] # Use the first available domain by default
+        domain = domains[0]
 
-    # If no username is provided, Mail.tm generates a random one.
-    # We can also generate a random one if we want more control.
     if not username:
         import uuid
-        username = str(uuid.uuid4()).split('-')[0] # Simple random string
+        username = str(uuid.uuid4()).split('-')[0]
 
     try:
-        payload = {"address": f"{username}@{domain}", "password": "temp_password"} # Password is required but not really used by us
+        payload = {"address": f"{username}@{domain}", "password": "temp_password"}
         response = requests.post(f"{MAILTM_API_URL}/accounts", json=payload)
         response.raise_for_status()
         account_data = response.json()
         
-        # Get authentication token for the new account
         token_response = requests.post(f"{MAILTM_API_URL}/token", json={"address": account_data["address"], "password": "temp_password"})
         token_response.raise_for_status()
         token_data = token_response.json()
@@ -108,7 +165,7 @@ async def create_account(username=None, domain=None):
         }, None
     except requests.exceptions.RequestException as e:
         print(f"Error creating account: {e}")
-        if response.status_code == 422: # Unprocessable Entity, often means address already exists
+        if response.status_code == 422:
             return None, f"Could not create address. It might already exist or the domain is invalid. Try generating a new one."
         return None, f"Failed to create temporary email: {e}"
 
@@ -147,7 +204,7 @@ async def delete_account(account_id, token):
         print(f"Error deleting account: {e}")
         return False, f"Failed to delete account: {e}"
 
-# --- Telegram Bot Command Handlers ---
+# --- Telegram Bot Command Handlers (Modified to use DB) ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message and instructions."""
@@ -162,15 +219,16 @@ async def generate_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Generates a new temporary email address for the user."""
     chat_id = update.effective_chat.id
     
-    # If an email already exists, offer to delete it first
-    if chat_id in user_emails:
+    current_email_info = await get_user_email(chat_id) # Check DB
+
+    if current_email_info:
         keyboard = [[
             InlineKeyboardButton("Yes, generate new", callback_data="confirm_generate"),
             InlineKeyboardButton("No, keep current", callback_data="cancel_generate")
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            f"You already have an active temporary email: `{user_emails[chat_id]['address']}`. "
+            f"You already have an active temporary email: `{current_email_info['address']}`. "
             "Generating a new one will delete the old one. Are you sure you want to proceed?",
             parse_mode="Markdown",
             reply_markup=reply_markup
@@ -181,7 +239,7 @@ async def generate_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     account_info, error = await create_account()
     if account_info:
-        user_emails[chat_id] = account_info
+        await store_user_email(chat_id, account_info) # Store in DB
         await update.message.reply_text(
             f"Your new temporary email address is:\n`{account_info['address']}`\n\n"
             "Use /inbox to check for messages."
@@ -195,12 +253,14 @@ async def inbox(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Checks the inbox of the current temporary email address."""
     chat_id = update.effective_chat.id
 
-    if chat_id not in user_emails:
+    current_email_info = await get_user_email(chat_id) # Get from DB
+
+    if not current_email_info:
         await update.message.reply_text("You don't have an active temporary email address. Use /generate to get one.")
         return
 
-    account_id = user_emails[chat_id]["id"]
-    token = user_emails[chat_id]["token"]
+    account_id = current_email_info["id"]
+    token = current_email_info["token"]
     
     await update.message.reply_text("Checking your inbox, please wait...")
     
@@ -213,7 +273,6 @@ async def inbox(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             from_address = msg.get('from', {}).get('address', 'Unknown Sender')
             msg_id = msg.get('id')
             
-            # Create a button for each message to view its content
             keyboard = [[InlineKeyboardButton(f"Subject: {subject} (From: {from_address})", callback_data=f"view_msg_{msg_id}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -224,11 +283,6 @@ async def inbox(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=reply_markup
             )
         
-        # Original single message summary (can be removed if individual messages are preferred)
-        # await update.message.reply_text(
-        #     "Here are your messages:\n\n" + "\n\n".join(message_list),
-        #     parse_mode="Markdown"
-        # )
     else:
         await update.message.reply_text("Your inbox is empty.")
 
@@ -236,7 +290,9 @@ async def delete_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Deletes the current temporary email address."""
     chat_id = update.effective_chat.id
 
-    if chat_id not in user_emails:
+    current_email_info = await get_user_email(chat_id) # Get from DB
+
+    if not current_email_info:
         await update.message.reply_text("You don't have an active temporary email address to delete.")
         return
 
@@ -246,7 +302,7 @@ async def delete_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        f"Are you sure you want to delete your current temporary email address: `{user_emails[chat_id]['address']}`?",
+        f"Are you sure you want to delete your current temporary email address: `{current_email_info['address']}`?",
         parse_mode="Markdown",
         reply_markup=reply_markup
     )
@@ -255,19 +311,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     """Handles inline keyboard button presses."""
     query = update.callback_query
     chat_id = query.message.chat_id
-    await query.answer() # Acknowledge the callback query
+    await query.answer()
 
     if query.data == "confirm_delete":
-        if chat_id not in user_emails:
+        current_email_info = await get_user_email(chat_id) # Get from DB
+        if not current_email_info:
             await query.edit_message_text("No active email to delete.")
             return
 
-        account_id = user_emails[chat_id]["id"]
-        token = user_emails[chat_id]["token"]
+        account_id = current_email_info["id"]
+        token = current_email_info["token"]
         
         success, error = await delete_account(account_id, token)
         if success:
-            del user_emails[chat_id]
+            await delete_user_email_from_db(chat_id) # Delete from DB
             await query.edit_message_text("Your temporary email address has been deleted successfully.")
         else:
             await query.edit_message_text(f"Failed to delete your temporary email address. {error}")
@@ -277,20 +334,21 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif query.data == "confirm_generate":
         # Delete old email first
-        if chat_id in user_emails:
-            account_id = user_emails[chat_id]["id"]
-            token = user_emails[chat_id]["token"]
+        current_email_info = await get_user_email(chat_id) # Get from DB
+        if current_email_info:
+            account_id = current_email_info["id"]
+            token = current_email_info["token"]
             success, error = await delete_account(account_id, token)
             if not success:
                 await query.edit_message_text(f"Could not delete old email: {error}. Please try /generate again.")
                 return
-            del user_emails[chat_id] # Remove from in-memory storage after successful deletion
+            await delete_user_email_from_db(chat_id) # Delete from DB
 
         # Then generate new
         await query.edit_message_text("Generating a new temporary email address, please wait...")
         account_info, error = await create_account()
         if account_info:
-            user_emails[chat_id] = account_info
+            await store_user_email(chat_id, account_info) # Store in DB
             await query.edit_message_text(
                 f"Your new temporary email address is:\n`{account_info['address']}`\n\n"
                 "Use /inbox to check for messages."
@@ -305,21 +363,22 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif query.data.startswith("view_msg_"):
         message_id = query.data.split("_")[2]
-        if chat_id not in user_emails:
+        current_email_info = await get_user_email(chat_id) # Get from DB
+        if not current_email_info:
             await query.edit_message_text("Session expired. Please generate a new email.")
             return
         
-        account_id = user_emails[chat_id]["id"]
-        token = user_emails[chat_id]["token"]
+        account_id = current_email_info["id"]
+        token = current_email_info["token"]
 
         message_content = await get_message_content(account_id, message_id, token)
         if message_content:
             subject = message_content.get('subject', 'No Subject')
             from_address = message_content.get('from', {}).get('address', 'Unknown Sender')
+            # Prefer 'text' over 'html' if available for cleaner display in Telegram
             text_body = message_content.get('text', message_content.get('html', 'No content available')).strip()
             
-            # Limit message length to avoid Telegram API limits
-            if len(text_body) > 4000:
+            if len(text_body) > 4000: # Telegram message limit is 4096 characters
                 text_body = text_body[:3900] + "\n\n... (Message truncated)"
 
             await query.edit_message_text(
@@ -330,6 +389,19 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
         else:
             await query.edit_message_text("Could not retrieve message content.")
+
+
+async def post_startup_init(application: Application):
+    """Initializes database pool after the bot starts."""
+    await init_db_pool()
+
+async def pre_shutdown_cleanup(application: Application):
+    """Closes database pool before bot shuts down."""
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+        print("PostgreSQL connection pool closed.")
+
 
 def main() -> None:
     """Starts the bot."""
@@ -348,6 +420,18 @@ def main() -> None:
     
     # Register callback query handler for inline buttons
     application.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    # Register handlers for application lifecycle events
+    application.add_handler(CommandHandler("start", start)) # Make sure start handler is still here
+    application.add_handler(CommandHandler("generate", generate_email))
+    application.add_handler(CommandHandler("inbox", inbox))
+    application.add_handler(CommandHandler("delete", delete_email))
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    # Add post-startup and pre-shutdown hooks
+    application.post_init(post_startup_init)
+    application.pre_shutdown(pre_shutdown_cleanup)
+
 
     print("Bot started. Listening for updates...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
