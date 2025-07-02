@@ -26,25 +26,37 @@ async def get_domains():
         response = requests.get(f"{MAILTM_API_URL}/domains")
         response.raise_for_status()  # Raise an exception for HTTP errors (e.g., 404, 500)
 
-        # Check if the response content is not empty and is valid JSON
         if not response.text: # Check if response body is empty
             print("Mail.tm /domains endpoint returned empty response.")
             return []
 
-        domains = response.json()
+        data = response.json() # Changed variable name from 'domains' to 'data'
 
-        # Crucial: Ensure 'domains' is a list/array as expected
-        if not isinstance(domains, list):
-            print(f"Mail.tm /domains endpoint returned non-list data: {domains}")
-            return [] # Return empty list if not an array
+        # --- THIS IS THE CRUCIAL CHANGE ---
+        # Check if 'data' is a dictionary and contains 'hydra:member' key
+        if isinstance(data, dict) and 'hydra:member' in data:
+            domains_list = data['hydra:member']
+        else:
+            # Fallback if 'hydra:member' isn't found or 'data' isn't a dict.
+            # This covers cases where it might be a direct list of domains, or unexpected format.
+            print(f"Mail.tm /domains endpoint returned unexpected top-level data structure: {data}")
+            if isinstance(data, list): # Check if it's already a list (might happen)
+                domains_list = data
+            else:
+                return [] # Cannot process this format
 
-        # Check if any domains were actually returned in the list
-        if not domains:
-            print("Mail.tm /domains endpoint returned an empty list of domains.")
+        # Ensure 'domains_list' is actually a list/array
+        if not isinstance(domains_list, list):
+            print(f"Mail.tm /domains endpoint 'hydra:member' data is not a list: {domains_list}")
             return []
 
-        # Assuming each item in the list is a dictionary with a 'domain' key
-        return [d["domain"] for d in domains if "domain" in d]
+        if not domains_list:
+            print("Mail.tm /domains endpoint returned an empty list of domains (or hydra:member was empty).")
+            return []
+
+        # Extract domain names from the list of domain objects
+        # Using a list comprehension with a check for the 'domain' key
+        return [d["domain"] for d in domains_list if isinstance(d, dict) and "domain" in d]
 
     except requests.exceptions.HTTPError as e:
         print(f"HTTP Error fetching domains: {e.response.status_code} - {e.response.text}")
@@ -56,15 +68,12 @@ async def get_domains():
         print(f"Timeout Error fetching domains: {e}")
         return []
     except requests.exceptions.RequestException as e:
-        # Catch any other requests-related exceptions
         print(f"Generic Request Error fetching domains: {e}")
         return []
     except json.JSONDecodeError as e:
-        # If response.json() fails because it's not valid JSON
         print(f"JSON Decode Error fetching domains: {e} - Response text: {response.text}")
         return []
     except Exception as e:
-        # Catch any other unexpected errors
         print(f"An unexpected error occurred in get_domains: {e}")
         return []
 async def create_account(username=None, domain=None):
