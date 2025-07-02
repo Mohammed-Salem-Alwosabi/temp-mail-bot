@@ -24,13 +24,49 @@ async def get_domains():
     """Fetches available Mail.tm domains."""
     try:
         response = requests.get(f"{MAILTM_API_URL}/domains")
-        response.raise_for_status()  # Raise an exception for HTTP errors
-        domains = response.json()
-        return [d["domain"] for d in domains]
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching domains: {e}")
-        return []
+        response.raise_for_status()  # Raise an exception for HTTP errors (e.g., 404, 500)
 
+        # Check if the response content is not empty and is valid JSON
+        if not response.text: # Check if response body is empty
+            print("Mail.tm /domains endpoint returned empty response.")
+            return []
+
+        domains = response.json()
+
+        # Crucial: Ensure 'domains' is a list/array as expected
+        if not isinstance(domains, list):
+            print(f"Mail.tm /domains endpoint returned non-list data: {domains}")
+            return [] # Return empty list if not an array
+
+        # Check if any domains were actually returned in the list
+        if not domains:
+            print("Mail.tm /domains endpoint returned an empty list of domains.")
+            return []
+
+        # Assuming each item in the list is a dictionary with a 'domain' key
+        return [d["domain"] for d in domains if "domain" in d]
+
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP Error fetching domains: {e.response.status_code} - {e.response.text}")
+        return []
+    except requests.exceptions.ConnectionError as e:
+        print(f"Connection Error fetching domains: {e}")
+        return []
+    except requests.exceptions.Timeout as e:
+        print(f"Timeout Error fetching domains: {e}")
+        return []
+    except requests.exceptions.RequestException as e:
+        # Catch any other requests-related exceptions
+        print(f"Generic Request Error fetching domains: {e}")
+        return []
+    except json.JSONDecodeError as e:
+        # If response.json() fails because it's not valid JSON
+        print(f"JSON Decode Error fetching domains: {e} - Response text: {response.text}")
+        return []
+    except Exception as e:
+        # Catch any other unexpected errors
+        print(f"An unexpected error occurred in get_domains: {e}")
+        return []
 async def create_account(username=None, domain=None):
     """Creates a new temporary email account."""
     if not domain:
